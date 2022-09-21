@@ -25,16 +25,17 @@ from circuit_training.environment import observation_config
 from circuit_training.environment import observation_extractor
 from circuit_training.environment import placement_util
 from circuit_training.environment import plc_client
+from circuit_training.environment import plc_client_os
 import gin
 import gym
 import numpy as np
+import random, sys
 import tensorflow as tf
 from tf_agents.environments import suite_gym
 from tf_agents.environments import wrappers
 
 ObsType = Dict[Text, np.ndarray]
 InfoType = Dict[Text, float]
-
 
 class InfeasibleActionError(ValueError):
   """An infeasible action were passed to the env."""
@@ -55,13 +56,12 @@ class InfeasibleActionError(ValueError):
     return 'Infeasible action (%s) when the mask is (%s)' % (self.action,
                                                              self.mask)
 
-
 @gin.configurable
 def cost_info_function(
     plc: plc_client.PlacementCost,
     done: bool,
     wirelength_weight: float = 1.0,
-    density_weight: float = 1.0,
+    density_weight: float = 0.5,
     congestion_weight: float = 0.5) -> Tuple[float, Dict[Text, float]]:
   """Returns the RL cost and info.
 
@@ -104,6 +104,65 @@ def cost_info_function(
 
   if density_weight > 0.0:
     density = plc.get_density_cost()
+    proxy_cost += density_weight * density
+
+  info = {
+      'wirelength': wirelength,
+      'congestion': congestion,
+      'density': density,
+  }
+
+  return proxy_cost, info
+
+# OS
+@gin.configurable
+def cost_info_function_os(
+    plc_os: plc_client_os.PlacementCost,
+    done: bool,
+    wirelength_weight: float = 1.0,
+    density_weight: float = 0.5,
+    congestion_weight: float = 0.5) -> Tuple[float, Dict[Text, float]]:
+  """Returns the RL cost and info.
+
+  Args:
+    plc: Placement cost object.
+    done: Set if it is the terminal step.
+    wirelength_weight:  Weight of wirelength in the reward function.
+    density_weight: Weight of density in the reward function.
+    congestion_weight: Weight of congestion in the reward function used only for
+      legalizing the placement in greedy std cell placer.
+
+  Returns:
+    The RL cost.
+
+  Raises:
+    ValueError: When the cost mode is not supported.
+
+  Notes: we found the default congestion and density weights more stable.
+  """
+  proxy_cost = 0.0
+
+  if not done:
+    return proxy_cost, {
+        'wirelength': -1.0,
+        'congestion': -1.0,
+        'density': -1.0,
+    }
+
+  wirelength = -1.0
+  congestion = -1.0
+  density = -1.0
+
+  if wirelength_weight > 0.0:
+    wirelength = plc_os.get_cost()
+    proxy_cost += wirelength_weight * wirelength
+
+  if congestion_weight > 0.0:
+    congestion = plc_os.get_congestion_cost()
+    proxy_cost += congestion_weight * congestion
+
+  if density_weight > 0.0:
+    density = plc_os.get_density_cost()
     proxy_cost += density_weight * density
 
   info = {
@@ -175,6 +234,7 @@ class CircuitEnv(object):
     self.netlist_file = netlist_file
     self._std_cell_placer_mode = std_cell_placer_mode
     self._cost_info_fn = cost_info_fn
+    self._cost_info_fn_os = cost_info_function_os # OS
     self._is_eval = is_eval
     self._save_best_cost = save_best_cost
     self._output_plc_file = output_plc_file
@@ -186,6 +246,13 @@ class CircuitEnv(object):
 
     self._plc = create_placement_cost_fn(
         netlist_file=netlist_file, init_placement=init_placement)
+    
+    # OS
+    self._plc_os = placement_util.create_placement_cost_os(
+         netlist_file=netlist_file, init_placement=init_placement)
+    
+    # OS
+    self._hash = -1
 
     # We call ObservationExtractor before unplace_all_nodes, so we use the
     # inital placement in the static features (location_x and location_y).
@@ -193,6 +260,9 @@ class CircuitEnv(object):
     self._observation_config = observation_config.ObservationConfig()
     self._observation_extractor = observation_extractor.ObservationExtractor(
         plc=self._plc)
+    # OS
+    self._observation_extractor_os = observation_extractor.ObservationExtractor(
+        plc=self._plc_os)
 
     if self._make_soft_macros_square:
       # It is better to make the shape of soft macros square before using
@@ -203,14 +273,49 @@ class CircuitEnv(object):
     self._canvas_width, self._canvas_height = self._plc.get_canvas_width_height(
     )
 
+    # OS
+    self._grid_cols, self._grid_rows = self._plc_os.get_grid_num_columns_rows()
+    self._canvas_width, self._canvas_height = self._plc_os.get_canvas_width_height(
+    )
+
     self._hard_macro_indices = [
         m for m in self._plc.get_macro_indices()
         if not self._plc.is_node_soft_macro(m)
     ]
+
+    # OS
+    self._hard_macro_indices_os = [
+        m for m in self._plc_os.get_macro_indices()
+        if not self._plc_os.is_node_soft_macro(m)
+    ]
+
+    if not (np.array(self._hard_macro_indices) == np.array(self._hard_macro_indices_os)).all():
+        logging.info('*****DISCREPENCY FOUND IN HARD MACRO INDICES*****')
+        with open('./failed_node_indices/hard_macro_indices_{}.npy'.format(str(self._hash)), 'wb') as f:
+          # GL
+          np.save(f, np.array(self._hard_macro_indices))
+          # OS
+          np.save(f, np.array(self._hard_macro_indices_os))
+    else:
+      logging.info('* hard macro indices matched *')
+
     self._num_hard_macros = len(self._hard_macro_indices)
 
     self._sorted_node_indices = placement_util.get_ordered_node_indices(
         mode='descending_size_macro_first', plc=self._plc)
+    # OS
+    self._sorted_node_indices_os = placement_util.get_ordered_node_indices(
+        mode='descending_size_macro_first', plc=self._plc_os)
+
+    if not (np.array(self._sorted_node_indices_os) == np.array(self._sorted_node_indices)).all():
+        logging.info('*****DISCREPENCY FOUND IN NODE_INDICES*****')
+        with open('./failed_node_indices/sorted_indices_{}.npy'.format(str(self._hash)), 'wb') as f:
+          # GL
+          np.save(f, np.array(self._sorted_node_indices))
+          # OS
+          np.save(f, np.array(self._sorted_node_indices_os))
+    else:
+      logging.info('* node indices matched *')
 
     self._sorted_soft_macros = self._sorted_node_indices[self._num_hard_macros:]
 
@@ -218,7 +323,14 @@ class CircuitEnv(object):
     # self.macro_indices. Needed because node adjacency matrix is in the same
     # node order of plc.get_macro_indices.
     self._macro_index_to_pos = {}
-    for i, macro_index in enumerate(self._plc.get_macro_indices()):
+    # for i, macro_index in enumerate(self._plc.get_macro_indices()):
+    #   self._macro_index_to_pos[macro_index] = i
+    # OS
+    for i, (macro_index, macro_index_os) in enumerate(zip(self._plc.get_macro_indices(), self._plc_os.get_macro_indices())):
+      if macro_index != macro_index_os:
+        logging.info('*****DISCREPENCY FOUND IN MACRO_INDEX*****')
+        with open('./failed_macro_index.txt', 'a+') as f:
+          f.write("[hash:{}] at {}, gl: {}, os: {}".format(str(self._hash), str(i), str(macro_index), str(macro_index_os),'\n'))
       self._macro_index_to_pos[macro_index] = i
 
     # Padding for mapping the placement canvas on the agent canvas.
@@ -234,9 +346,25 @@ class CircuitEnv(object):
     self._current_node = 0
     self._done = False
     self._current_mask = self._get_mask()
+    # OS
+    self._current_mask_os = self._get_mask_os()
+
+    # Discrep Detection
+    if not (np.array(self._current_mask) == np.array(self._current_mask_os)).all():
+      logging.info('*****DISCREPENCY FOUND IN CURRENT MASK*****')
+      with open('./init_mask/run{}_node_{}.npy'.format(str(self._hash), str(self._current_node)), 'wb') as f:
+        # GL
+        np.save(f, np.array(self._current_mask))
+        # OS
+        np.save(f, np.array(self._current_mask_os))
+    else:
+      logging.info('* node mask matched *')
+
     if unplace_all_nodes_in_init:
       # TODO(b/223026568) Remove unplace_all_nodes from init
       self._plc.unplace_all_nodes()
+      # OS
+      self._plc_os.unplace_all_nodes()
       logging.warning('* Unplaced all Nodes in init *')
     logging.info('***Num node to place***:%s', self._num_hard_macros)
 
@@ -265,6 +393,7 @@ class CircuitEnv(object):
     """
     return self._observation_extractor.get_static_features()
 
+  # This is not used anywhere
   def get_cost_info(self,
                     done: bool = False) -> Tuple[float, Dict[Text, float]]:
     return self._cost_info_fn(plc=self._plc, done=done)  # pytype: disable=wrong-keyword-args  # trace-all-classes
@@ -280,6 +409,24 @@ class CircuitEnv(object):
     else:
       node_index = self._sorted_node_indices[self._current_node]
       mask = np.asarray(self._plc.get_node_mask(node_index), dtype=np.int32)
+      mask = np.reshape(mask, [self._grid_rows, self._grid_cols])
+      pad = ((self._up_pad, self._low_pad), (self._right_pad, self._left_pad))
+      mask = np.pad(mask, pad, mode='constant', constant_values=0)
+    return np.reshape(
+        mask, (self._observation_config.max_grid_size**2,)).astype(np.int32)
+  
+  # OS
+  def _get_mask_os(self) -> np.ndarray:
+    """Gets the node mask for the current node.
+
+    Returns:
+      List of 0s and 1s indicating if action is feasible or not.
+    """
+    if self._done:
+      mask = np.zeros(self._observation_config.max_grid_size**2, dtype=np.int32)
+    else:
+      node_index = self._sorted_node_indices[self._current_node]
+      mask = np.asarray(self._plc_os.get_node_mask(node_index), dtype=np.int32)
       mask = np.reshape(mask, [self._grid_rows, self._grid_cols])
       pad = ((self._up_pad, self._low_pad), (self._right_pad, self._left_pad))
       mask = np.pad(mask, pad, mode='constant', constant_values=0)
@@ -304,6 +451,26 @@ class CircuitEnv(object):
         previous_node_index=previous_node_index,
         current_node_index=current_node_index,
         mask=self._current_mask)
+
+  # OS
+  def _get_obs_os(self) -> ObsType:
+    """Returns the observation."""
+    if self._current_node > 0:
+      previous_node_sorted = self._sorted_node_indices_os[self._current_node - 1]
+      previous_node_index = self._macro_index_to_pos[previous_node_sorted]
+    else:
+      previous_node_index = -1
+
+    if self._current_node < self._num_hard_macros:
+      current_node_sorted = self._sorted_node_indices_os[self._current_node]
+      current_node_index = self._macro_index_to_pos[current_node_sorted]
+    else:
+      current_node_index = 0
+
+    return self._observation_extractor_os.get_all_features(
+        previous_node_index=previous_node_index,
+        current_node_index=current_node_index,
+        mask=self._current_mask_os)
 
   def _run_cd(self):
     """Runs coordinate descent to finetune the current placement."""
@@ -374,6 +541,31 @@ class CircuitEnv(object):
     # This is realized by setting intermediate steps cost as zero, and
     # propagate the final cost with discount factor set to 1 in replay buffer.
     cost, info = self._cost_info_fn(self._plc, self._done)
+    # OS
+    cost_os, info_os = self._cost_info_fn(self._plc_os, self._done)
+
+    # Discrep Detection
+    if abs(cost_os - cost) >= 1e-2 and self._current_node == self._num_hard_macros:
+      logging.info('*****DISCREPENCY FOUND IN PROXY COST*****')
+      cd_plc_file = './failed_proxy_plc/' + str(cost) + '_vs_' + str(cost_os)
+      comment = '***GL***\ncongestion cost:{}\nwirelength cost:{}\ndensity cost:{}\n'\
+        .format(self._plc.get_congestion_cost(), self._plc.get_cost(), self._plc.get_density_cost())
+      comment += 'canvas_width_height:{}' + str(self._plc.get_canvas_width_height())
+      comment += 'get_grid_num_columns_rows:{}' + str(self._plc.get_grid_num_columns_rows())
+      
+      comment += '***OS***\ncongestion cost:{}\nwirelength cost:{}\ndensity cost:{}\n'\
+        .format(self._plc_os.get_congestion_cost(), self._plc_os.get_cost(), self._plc_os.get_density_cost())
+      
+      
+      placement_util.save_placement(self._plc_os, cd_plc_file, comment)
+      # also save all coordinate
+      with open('./failed_proxy_coord/{}_vs_{}.npy'.format(str(cost), str(cost_os)), 'wb') as f:
+        # GL
+        np.save(f, np.array(list(placement_util.get_node_xy_coordinates(self._plc).items())))
+        # OS
+        np.save(f, np.array(list(placement_util.get_node_xy_coordinates(self._plc_os).items())))
+    else:
+      logging.info('* proxy cost matched *')
 
     # We only save placement if all nodes by placed RL, because the dreamplace
     # mix-sized placement may not be legal.
@@ -383,17 +575,35 @@ class CircuitEnv(object):
     return -cost, info
 
   def reset(self) -> ObsType:
-    """Restes the environment.
+    """Resets the environment.
 
     Returns:
       An initial observation.
     """
+    self._hash = random.randint(0, sys.maxsize)
+
     self._plc.unplace_all_nodes()
+    #OS
+    self._plc_os.unplace_all_nodes()
     self._current_actions = []
     self._current_node = 0
     self._done = False
     self._current_mask = self._get_mask()
-    return self._get_obs()
+    self._current_mask_os = self._get_mask_os()
+    
+    obs = self._get_obs()
+    obs_os = self._get_obs_os()
+
+    for feature_gl, feature_os in zip(obs, obs_os):
+      if not (obs[feature_gl] == obs_os[feature_os]).all():
+        logging.info('*****DISCREPENCY FOUND IN OBSERVATION*****')
+        with open('./failed_obs/reset_{}_feature_{}.npy'.format(str(self._hash), str(feature_gl)+'@'+str(feature_os)), 'wb') as f:
+          # GL
+          np.save(f, np.array(obs[feature_gl]))
+          # OS
+          np.save(f, np.array(obs_os[feature_os]))
+
+    return obs
 
   def translate_to_original_canvas(self, action: int) -> int:
     """Translates a raw location to real one in the original canvas."""
@@ -402,6 +612,7 @@ class CircuitEnv(object):
 
     a_i = action // self._observation_config.max_grid_size - up_pad
     a_j = action % self._observation_config.max_grid_size - right_pad
+
     if 0 <= a_i < self._grid_rows or 0 <= a_j < self._grid_cols:
       action = a_i * self._grid_cols + a_j
     else:
@@ -409,7 +620,13 @@ class CircuitEnv(object):
     return action
 
   def place_node(self, node_index: int, action: int) -> None:
+    print(">>>>GL: " + str(self.translate_to_original_canvas(action)))
     self._plc.place_node(node_index, self.translate_to_original_canvas(action))
+    #OS
+    print(">>>>OS: " + str(self.translate_to_original_canvas(action)))
+    self._plc_os.place_node(node_index, self.translate_to_original_canvas(action))
+
+    print(">>>>GL Placed {}: {}, OS Placed {}: {}".format(str(node_index), str(self._plc.get_node_location(node_index)), str(node_index), str(self._plc_os.get_node_location(node_index))))
 
   def analytical_placer(self) -> None:
     if self._std_cell_placer_mode == 'fd':
@@ -441,12 +658,24 @@ class CircuitEnv(object):
       raise InfeasibleActionError(action, self._current_mask)
 
     node_index = self._sorted_node_indices[self._current_node]
-    self.place_node(node_index, action)
+    self.place_node(node_index, action) # OS place at the same time
 
     self._current_node += 1
     self._done = (self._current_node == self._num_hard_macros)
     self._current_mask = self._get_mask()
+    self._current_mask_os = self._get_mask_os() # OS
 
+    # Discrep Detection
+    if not (np.array(self._current_mask) == np.array(self._current_mask_os)).all():
+      logging.info('*****DISCREPENCY FOUND IN CURRENT MASK*****')
+      with open('./failed_mask/action_{}_node_{}.npy'.format(str(action), str(node_index)), 'wb') as f:
+        # GL
+        np.save(f, np.array(self._current_mask))
+        # OS
+        np.save(f, np.array(self._current_mask_os))
+    else:
+      logging.info('* node mask matched *')
+    
     if not self._done and not np.any(self._current_mask):
       logging.info('Actions took before becoming infeasible: %s',
                    self._current_actions)
@@ -459,7 +688,20 @@ class CircuitEnv(object):
 
     cost, info = self.call_analytical_placer_and_get_cost()
 
-    return self._get_obs(), cost, self._done, info
+    # OS
+    obs = self._get_obs()
+    obs_os = self._get_obs_os()
+
+    for feature_gl, feature_os in zip(obs, obs_os):
+      if not (obs[feature_gl] == obs_os[feature_os]).all() and not _done:
+        logging.info('*****DISCREPENCY FOUND IN OBSERVATION*****')
+        with open('./failed_obs/step_{}_feature_{}.npy'.format(str(self._hash), str(feature_gl)+'@'+str(feature_os)), 'wb') as f:
+          # GL
+          np.save(f, np.array(obs[feature_gl]))
+          # OS
+          np.save(f, np.array(obs_os[feature_os]))
+
+    return obs, cost, self._done, info
 
 
 def create_circuit_environment(*args, **kwarg) -> wrappers.ActionClipWrapper:
