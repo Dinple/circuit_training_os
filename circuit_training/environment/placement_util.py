@@ -25,6 +25,7 @@ from typing import Dict, Iterator, List, Optional, Tuple, Any, Union
 
 from absl import logging
 from circuit_training.environment import plc_client
+from circuit_training.environment import plc_client_os
 import numpy as np
 
 # Internal gfile dependencies
@@ -259,6 +260,84 @@ def create_placement_cost(
     fix_port_coordinates(plc)
 
   return plc
+
+# OS
+def create_placement_cost_os(
+    netlist_file: str,
+    init_placement: Optional[str] = None,
+    overlap_threshold: float = 4e-3,
+    congestion_smooth_range: int = 2,
+    # TODO(b/211039937): Increase macro spacing to 3-5um, after matching the
+    # performance for Ariane.
+    macro_macro_x_spacing: float = 0.1,
+    macro_macro_y_spacing: float = 0.1,
+    boundary_check: bool = False,
+    horizontal_routes_per_micron: float = 70.33,
+    vertical_routes_per_micron: float = 74.51,
+    macro_horizontal_routing_allocation: float = 51.79,
+    macro_vertical_routing_allocation: float = 51.79,
+) -> plc_client_os.PlacementCost:
+  """Creates a placement_cost object.
+
+  Args:
+    netlist_file: Path to the netlist proto text file.
+    init_placement: Path to the inital placement .plc file.
+    overlap_threshold: Used for macro overlap detection.
+    congestion_smooth_range: Smoothing factor used for congestion estimation.
+      Congestion is distributed to this many neighboring columns/rows.'
+    macro_macro_x_spacing: Macro-to-macro x spacing in microns.
+    macro_macro_y_spacing: Macro-to-macro y spacing in microns.
+    boundary_check: Do a boundary check during node placement.
+    horizontal_routes_per_micron: Horizontal route capacity per micros.
+    vertical_routes_per_micron: Vertical route capacity per micros.
+    macro_horizontal_routing_allocation: Macro horizontal routing allocation.
+    macro_vertical_routing_allocation: Macro vertical routing allocation.
+
+  Returns:
+    A PlacementCost OS object.
+  """
+  if not netlist_file:
+    raise ValueError('netlist_file should be provided.')
+
+  block_name = extract_attribute_from_comments('Block',
+                                               [init_placement, netlist_file])
+  if not block_name:
+    logging.warning(
+        'block_name is not set. '
+        'Please add the block_name in:\n%s\nor in:\n%s', netlist_file,
+        init_placement)
+
+  plc_os = plc_client_os.PlacementCost(netlist_file, macro_macro_x_spacing,
+                                 macro_macro_y_spacing)
+
+  blockages = get_blockages_from_comments([netlist_file, init_placement])
+  if blockages:
+    for blockage in blockages:
+      plc_os.create_blockage(*blockage)
+
+  sizes = extract_sizes_from_comments([netlist_file, init_placement])
+  if sizes:
+    canvas_width, canvas_height, grid_cols, grid_rows = sizes
+    if canvas_width and canvas_height and grid_cols and grid_rows:
+      plc_os.set_canvas_size(canvas_width, canvas_height)
+      plc_os.set_placement_grid(grid_cols, grid_rows)
+
+  plc_os.set_project_name('circuit_training')
+  plc_os.set_block_name(block_name or 'unset_block')
+  plc_os.set_routes_per_micron(horizontal_routes_per_micron,
+                            vertical_routes_per_micron)
+  plc_os.set_macro_routing_allocation(macro_horizontal_routing_allocation,
+                                   macro_vertical_routing_allocation)
+  plc_os.set_congestion_smooth_range(congestion_smooth_range)
+  plc_os.set_overlap_threshold(overlap_threshold)
+  plc_os.set_canvas_boundary_check(boundary_check)
+  plc_os.make_soft_macros_square()
+  if init_placement:
+    plc_os.restore_placement(init_placement)
+    fix_port_coordinates(plc_os)
+
+  return plc_os
+
 
 
 def get_node_type_counts(plc: plc_client.PlacementCost) -> Dict[str, int]:
